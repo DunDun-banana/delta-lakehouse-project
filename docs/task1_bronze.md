@@ -1,156 +1,99 @@
-# Task 2 Handoff - Silver Layer Enrichment & CDC
+# Task 1 - Bronze Layer Ingestion
 
-## 1. Trạng thái đầu vào
+Bronze dùng Parquet làm input và append vào Delta table. Không chuyển sang
+JSON, không lọc invalid records và không deduplicate trong Bronze.
 
-Các file raw cần có:
+## Input
 
-~~~
-data/raw_json/batch_001.json  -> 70,000 dòng
-data/raw_json/batch_002.json  -> 30,250 dòng
-~~~
+Official data:
 
-Sau khi chạy hai batch, Bronze Delta table nằm tại:
+```text
+data/source/yellow_tripdata_2025-01.parquet ... yellow_tripdata_2025-12.parquet
+```
 
-~~~
-data/bronze/taxi_trips
-~~~
+Dirty fixture:
 
-Bronze dùng append-only. Batch 2 có 250 bản ghi duplicate được giữ nguyên; việc loại duplicate thuộc Silver.
+```text
+data/landing/dirty_test.parquet/
+```
 
-Không cần commit data/bronze/, vì đây là Delta output có thể tạo lại. Nếu raw JSON không nằm trong Git, cần bàn giao artifact đó hoặc chạy lại prepare_dirty_json.py với source Parquet.
+Fixture chứa malformed dates, missing location IDs, missing synthetic
+coordinates, invalid fares và duplicate records. Dữ liệu gốc trong
+`data/source/` không bị sửa.
 
-## 2. Môi trường
+## Chạy
 
-Cần có:
+Từ thư mục gốc repository:
 
-- Python virtual environment spark_env.
+```powershell
+python src\bronze\prepare_dirty_parquet.py
+python src\bronze\bronze_ingestion.py
+```
+
+Lệnh ingestion mặc định đọc 12 file tháng rồi append dirty fixture vào:
+
+```text
+data/bronze/taxi_trips/
+```
+
+Mỗi file tháng là một batch. Không chạy lại cùng input nếu không muốn tạo
+thêm bản ghi trùng trong append-only Bronze.
+
+Có thể chọn batch thủ công:
+
+```powershell
+python src\bronze\bronze_ingestion.py `
+  --input data\source\yellow_tripdata_2025-01.parquet `
+  --input data\landing\dirty_test.parquet `
+  --output data\bronze\taxi_trips
+```
+
+## Contract bàn giao cho Silver
+
+Silver đọc Delta bằng:
+
+```python
+bronze_df = spark.read.format("delta").load("data/bronze/taxi_trips")
+```
+
+Bronze cung cấp:
+
+- `trip_id`: giữ ID của dirty fixture hoặc tạo deterministic ID cho source.
+- `tpep_pickup_datetime`, `tpep_dropoff_datetime`: lưu dạng string để giữ
+  malformed dates.
+- `PULocationID`, `DOLocationID`: chuẩn hóa thành long; null vẫn được giữ.
+- `record_source`: `official_tlc` hoặc `generated_fixture`.
+- `source_file`, `source_path`, `ingest_batch_id`, `ingested_at`,
+  `raw_record_hash`: metadata lineage.
+
+Bronze vẫn giữ `fare_amount <= 0`, missing location IDs, missing coordinates
+và duplicate records. Silver chịu trách nhiệm parse dates, filter invalid
+records và deduplicate theo `trip_id`.
+
+Bronze không có CDC, `MERGE INTO`, update hoặc delete.
+
+## Kiểm tra
+
+```powershell
+Get-ChildItem data\bronze\taxi_trips\_delta_log -Filter *.json |
+  Sort-Object Name | Select-Object Name
+```
+
+Một commit được tạo cho mỗi batch append. Chạy mới toàn bộ 12 tháng và dirty
+fixture sẽ tạo khoảng 13 commit trong `_delta_log/`.
+
+## Môi trường
+
 - PySpark 3.5.9.
-- Delta Lake delta-spark 3.3.2.
-- Java 8.
-- Trên Windows: C:\Hadoop\bin\winutils.exe và C:\Hadoop\bin\hadoop.dll.
+- Delta Lake `delta-spark` 3.3.x.
+- Java/Hadoop configuration trên Windows.
+- Dữ liệu nguồn khoảng 830 MB; cần thêm dung lượng cho Delta output.
 
-Kiểm tra:
+## Checklist
 
-~~~powershell
-python --version
-python -c "import pyspark, delta; print('PySpark:', pyspark.__version__); print('Delta:', delta.__file__)"
-Test-Path C:\Hadoop\bin\winutils.exe
-Test-Path C:\Hadoop\bin\hadoop.dll
-~~~
-
-## 3. Sửa lỗi DeltaCatalog trong Notebook
-
-Không tạo Spark session thông thường rồi chỉ đặt config Delta. Nếu Delta JAR chưa được nạp, sẽ gặp:
-
-~~~
-Cannot find catalog plugin class for catalog 'spark_catalog':
-org.apache.spark.sql.delta.catalog.DeltaCatalog
-~~~
-
-Notebook phải chạy từ thư mục gốc repository và dùng helper của Bronze:
-
-~~~python
-from pathlib import Path
-import sys
-
-PROJECT_ROOT = Path.cwd()
-sys.path.insert(0, str(PROJECT_ROOT))
-
-from src.bronze.bronze_ingestion import RAW_SCHEMA, create_spark, ingest_batch
-
-spark = create_spark()
-~~~
-
-create_spark() đã cấu hình Delta extension, Delta catalog và Delta package. Nếu Notebook đã tạo một spark session sai cấu hình, hãy restart kernel trước khi chạy cell trên.
-
-## 4. Chuyển JSON vào Bronze bằng PowerShell
-
-Nếu raw JSON đã có sẵn, chạy batch 1:
-
-~~~powershell
-spark-submit.cmd --packages io.delta:delta-spark_2.12:3.3.2 src\bronze\bronze_ingestion.py --input data\raw_json\batch_001.json --output data\bronze\taxi_trips --batch-id batch_001
-~~~
-
-Sau đó chạy batch 2:
-
-~~~powershell
-spark-submit.cmd --packages io.delta:delta-spark_2.12:3.3.2 src\bronze\bronze_ingestion.py --input data\raw_json\batch_002.json --output data\bronze\taxi_trips --batch-id batch_002
-~~~
-
-Kết quả mong đợi:
-
-~~~text
-Batch 1: Appended rows: 70,000
-Batch 2: Appended rows: 30,250
-Bronze total rows: 100,250
-~~~
-
-Không chạy lại batch 1 nếu bảng đã tồn tại, vì lệnh dùng mode("append").
-
-Nếu cần tạo lại raw JSON từ source Parquet:
-
-~~~powershell
-python src\bronze\prepare_dirty_json.py --source data\source\yellow_tripdata_2025-01.parquet --output-dir data\raw_json --sample-size 100000
-~~~
-
-## 5. Chuyển JSON vào Bronze trong Notebook
-
-Dùng đúng implementation trong src/bronze/bronze_ingestion.py:
-
-~~~python
-BATCH_1 = PROJECT_ROOT / "data" / "raw_json" / "batch_001.json"
-BATCH_2 = PROJECT_ROOT / "data" / "raw_json" / "batch_002.json"
-BRONZE_PATH = PROJECT_ROOT / "data" / "bronze" / "taxi_trips"
-
-rows_batch_1 = ingest_batch(
-    spark=spark,
-    input_path=BATCH_1,
-    output_path=BRONZE_PATH,
-    batch_id="batch_001",
-)
-
-rows_batch_2 = ingest_batch(
-    spark=spark,
-    input_path=BATCH_2,
-    output_path=BRONZE_PATH,
-    batch_id="batch_002",
-)
-
-bronze_df = spark.read.format("delta").load(str(BRONZE_PATH))
-
-print("Batch 1 rows:", f"{rows_batch_1:,}")
-print("Batch 2 rows:", f"{rows_batch_2:,}")
-print("Bronze total rows:", f"{bronze_df.count():,}")
-bronze_df.printSchema()
-~~~
-
-Nếu Bronze đã có hai version, chỉ đọc và kiểm tra; không chạy lại hai lệnh ingest_batch.
-
-## 6. Kiểm tra Delta commit
-
-~~~powershell
-Get-ChildItem data\bronze\taxi_trips\_delta_log -Filter *.json | Sort-Object Name | Select-Object Name
-~~~
-
-Sau hai batch cần có:
-
-~~~text
-00000000000000000000.json
-00000000000000000001.json
-~~~
-
-Commit đầu tiên phải có numOutputRows = 70000. Commit thứ hai phải có numOutputRows = 30250 và mode = Append.
-
-## 9. Checklist nghiệm thu
-
-- [ ] Notebook/Spark session nạp được DeltaCatalog.
-- [ ] Batch 1 đọc được từ JSON và ghi Bronze.
-- [ ] Batch 2 append được vào Bronze.
-- [ ] Bronze có tổng 100,250 dòng sau hai batch.
-- [ ] Silver loại invalid trip theo rule đã ghi.
-- [ ] Silver deduplicate theo trip_id.
-- [ ] MERGE có ít nhất một UPDATE và một INSERT.
-- [ ] Cột surcharge_fee được thêm bằng schema evolution.
-- [ ] Data cũ vẫn đọc được sau khi schema thay đổi.
-- [ ] Code, test và tài liệu được commit cùng nhau.
-
+- [x] Đọc Parquet, không chuyển sang JSON.
+- [x] Append từng monthly batch vào Delta.
+- [x] Giữ malformed dates, missing IDs, missing coordinates và duplicates.
+- [x] Có trip ID và metadata lineage.
+- [x] Chuẩn hóa kiểu dữ liệu giữa source và dirty fixture.
+- [ ] Silver đọc Bronze và thực hiện cleaning/deduplication.

@@ -23,6 +23,8 @@ The goal is to help the team practice:
 - `docs/`: task documentation
 - `tests/`: unit test skeletons
 - `notebooks/`: demo notebooks
+- `data/source/`: local official monthly NYC TLC Parquet inputs
+- `data/landing/`: local generated dirty Parquet fixture for Bronze
 - `data/sample/`: small sample data
 
 ## Environment
@@ -73,6 +75,7 @@ If needed, open each module in its corresponding folder and run it according to 
 
 ## Notes
 
-- This file is the initial project skeleton.
-- The modules do not contain real business logic yet; they only include TODOs and placeholders.
-- Continue by completing each task and updating the related documentation.
+- Bronze ingestion is implemented for monthly Parquet batches and the dirty
+  Parquet fixture.
+- Silver, Gold, audit, optimization, and the end-to-end orchestration remain
+  follow-up work and should be completed with their related documentation.
