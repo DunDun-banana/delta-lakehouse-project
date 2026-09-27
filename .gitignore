@@ -9,3 +9,5 @@ data/gold/
 data/landing/
 logs/
 temp/
+data/tmp/
+data/checkpoints/
