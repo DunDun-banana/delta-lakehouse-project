@@ -1,3 +1,5 @@
-pyspark
-delta-spark
+# cấu hình khớp với file setup của thầy
+pyspark==3.4.1
+delta-spark==2.4.0
+findspark
 pytest
