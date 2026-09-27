@@ -34,7 +34,7 @@ Lệnh ingestion mặc định đọc 12 file tháng rồi append dirty fixture 
 
 ```text
 data/bronze/taxi_trips/
-```
+``` 
 
 Mỗi file tháng là một batch. Không chạy lại cùng input nếu không muốn tạo
 thêm bản ghi trùng trong append-only Bronze.
