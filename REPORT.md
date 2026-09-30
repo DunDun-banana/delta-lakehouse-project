@@ -59,6 +59,34 @@ The architecture follows a layered approach to improve data quality and maintain
 - support analytics queries and reporting
 - prepare simplified datasets for downstream consumers
 
+### Time Travel and Audit Verification
+
+Mỗi thao tác `MERGE` thành công tạo một Delta commit và một table version mới.
+Delta transaction log lưu các action cấu thành snapshot, vì vậy snapshot trước
+MERGE vẫn đọc được bằng `versionAsOf` mà không cần copy toàn bộ bảng.
+
+Task 3 đọc history qua `DeltaTable.history()`, chọn commit UPDATE và INSERT từ
+`operationMetrics`, rồi đọc version ngay trước/sau commit. Evidence nghiệm thu
+ngày 2026-09-30 trong `docs/evidence/task3_audit_2026-09-30_rerun.json` cho thấy:
+
+- UPDATE v43 -> v44 giữ nguyên `trip_id`, đổi `fare_amount` từ 26.8 thành 30.8
+  và `tip_amount` từ 5.86 thành 7.86; metrics xác nhận đúng 1 row được update.
+- INSERT v44 -> v45 làm một `trip_id` mới xuất hiện (45,849,822 -> 45,849,823
+  dòng); metrics xác nhận đúng 1 row được insert.
+- Commit v46 thêm `surcharge_fee` vào metadata của bảng và ghi giá trị 1.5 cho
+  bản ghi demo (commit này đồng thời update fare/tip của cùng trip).
+- Commit v43 là bulk UPDATE 2,992 dòng của dirty fixture, fare/tip không đổi, nên
+  không được dùng làm bằng chứng CDC.
+
+JSON commit trong `_delta_log` cho thấy UPDATE ghi file mới và remove file cũ,
+INSERT chỉ thêm file mới, còn schema evolution ghi action `metaData` với schema
+mới; action `protocol` ở v0 là reader 1 / writer 2. Vì MERGE là copy-on-write, file
+bị remove ở commit N thuộc snapshot N-1, nên audit chỉ đọc các file add/remove của
+commit được chọn: 37 giây thay vì khoảng 10 phút khi join hai snapshot khoảng 46
+triệu dòng. Audit không restore Silver; latest version trước và sau đều là v46 và
+toàn bộ file `_delta_log`/checkpoint không đổi sau khi chạy lại, nên Task 3 không
+thay đổi state mà Task 4 sử dụng.
+
 ## 7. Storage Optimization Summary
 
 This section should describe:
