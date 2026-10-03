@@ -1,11 +1,12 @@
 # Data folder
 
-Everything under `data/` is local-only and ignored by Git, except this file.
+Everything under `data/` is local-only and ignored by Git, except this file
+and `source/`.
 All paths are defined once in `src/common/config.py`.
 
 | Path | Content | Created by |
 |---|---|---|
-| `source/` | `yellow_tripdata_2025-01.parquet` ... `-12.parquet` from NYC TLC (~830 MB), never modified | manual download |
+| `source/` | `yellow_tripdata_2025-01.parquet` ... `-12.parquet` from NYC TLC, committed on purpose (12 files, ~792 MB), never modified | manual download |
 | `landing/dirty_test.parquet/` | 5,218-row dirty fixture (Parquet directory) | `src.bronze.prepare_dirty_parquet` |
 | `bronze/taxi_trips/` | Bronze Delta table | `src.bronze.bronze_ingestion` |
 | `silver/taxi_trips/` | Silver Delta table | `src.silver.silver_pipeline` |

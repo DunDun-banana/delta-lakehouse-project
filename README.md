@@ -109,6 +109,9 @@ Each layer can also be run on its own:
 
 ## Consistency rules
 
+- The 12 official source Parquet files are committed on purpose so the project
+  runs right after cloning; never commit generated Delta tables, checkpoints,
+  the dirty fixture or logs.
 - `data/checkpoints/silver_taxi` belongs to `data/silver/taxi_trips`,
   `rejected_records` and `batch_audit`. Delete or restore these **four
   together**, never one alone; otherwise Silver is either reprocessed or

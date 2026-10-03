@@ -1,6 +1,6 @@
-# Local data and Delta tables (only data/README.md is tracked)
 data/*
 !data/README.md
+!data/source/
 
 # Logs and runtime output
 logs/
