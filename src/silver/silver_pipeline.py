@@ -1,180 +1,254 @@
-"""Incremental Bronze -> Silver via Delta streaming and foreachBatch MERGE.
+"""Task 2 - incremental Bronze -> Silver with Delta streaming and foreachBatch MERGE.
 
-Run from repository root: python -m src.silver.silver_pipeline --once
+Bronze is read as a Delta stream; every microbatch is validated, deduplicated
+and MERGEd into Silver, rejected rows go to a quarantine table, and one audit
+row per microbatch is upserted into ``batch_audit``. The checkpoint records
+which Bronze commits are done, so re-running only processes new commits.
+
+Run from the project root:
+    python -m src.silver.silver_pipeline --once
 """
+
 from __future__ import annotations
+
 import argparse
 import json
 import logging
-import os
 from pathlib import Path
-from delta import configure_spark_with_delta_pip
-from delta.tables import DeltaTable
-from pyspark.sql import SparkSession, functions as F
-from .silver_cleaning import validate_and_split, deduplicate
-from .silver_merge import merge_silver, merge_rejected
-from src.audit.time_travel import latest_commit
 
-ROOT = Path(__file__).resolve().parents[2]
+from delta.tables import DeltaTable
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import functions as F
+
+from src.common.config import (
+    BATCH_AUDIT_PATH,
+    BRONZE_PATH,
+    REJECTED_PATH,
+    SILVER_CHECKPOINT,
+    SILVER_PATH,
+)
+from src.common.delta_utils import latest_commit
+from src.silver.silver_cleaning import deduplicate, validate_and_split
+from src.silver.silver_merge import merge_rejected, merge_silver
+
 LOG = logging.getLogger("silver")
 
-
-def make_spark(master: str | None = None) -> SparkSession:
-    # 1. Định vị và tạo sẵn thư mục tạm 'data/tmp' trên ổ D (theo đường dẫn dự án ROOT)
-    spark_tmp_dir = str(ROOT / "data" / "tmp")
-    Path(spark_tmp_dir).mkdir(parents=True, exist_ok=True)
-
-    builder = (SparkSession.builder.appName("Taxi-Silver-CDC")
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
-        .config("spark.databricks.delta.schema.autoMerge.enabled", "true")
-        .config("spark.sql.session.timeZone", "UTC")
-        .config("spark.sql.shuffle.partitions", os.getenv("SILVER_SHUFFLE_PARTITIONS", "16"))
-        .config("spark.driver.memory", os.getenv("SILVER_DRIVER_MEMORY", "4g"))  # Cấp 4GB RAM Heap cho Driver
-        .config("spark.sql.ansi.enabled", "false")  # Invalid demo timestamps -> null (Spark 3.4)
-        # 2. Ép Spark ghi toàn bộ file tạm Shuffle/Scratch sang đĩa D thay vì ổ C
-        .config("spark.local.dir", spark_tmp_dir)
-        )
-
-    
-    if master:
-        builder = builder.master(master)
-    return configure_spark_with_delta_pip(builder).getOrCreate()
+# The existing checkpoint is bound to this query name; do not rename it.
+QUERY_NAME = "silver_taxi_cdc"
 
 
-def process_batch(spark: SparkSession, df, batch_id: int, silver: str, rejected_path: str, audit_path: str):
-    # Spark may replay this microbatch after a crash; both data writes are MERGEs.
+def _version(commit: dict | None) -> int | None:
+    return commit["version"] if commit else None
+
+
+def _audit_row(
+    spark: SparkSession,
+    batch_id: int,
+    counts: dict[str, int],
+    before: dict | None,
+    after: dict | None,
+) -> DataFrame:
+    """Build the one-row audit DataFrame (column names and order are fixed).
+
+    Built from literals with ``spark.range(1)`` so no Python worker is started.
+    """
+
+    return spark.range(1).select(
+        F.lit(int(batch_id)).cast("long").alias("batch_id"),
+        F.lit(counts["incoming"]).cast("long").alias("incoming"),
+        F.lit(counts["valid"]).cast("long").alias("valid"),
+        F.lit(counts["rejected"]).cast("long").alias("rejected"),
+        F.lit(counts["winners"]).cast("long").alias("winners"),
+        F.current_timestamp().alias("processed_at"),
+        F.lit(_version(before)).cast("long").alias("silver_version_before"),
+        F.lit(_version(after)).cast("long").alias("silver_version_after"),
+        F.lit(after["operation"] if after else None).cast("string").alias("silver_operation"),
+        F.lit(json.dumps(after["operationMetrics"] if after else {})).alias(
+            "silver_operation_metrics"
+        ),
+        F.lit(after["timestamp"] if after else None).cast("string").alias(
+            "silver_commit_timestamp"
+        ),
+    )
+
+
+def _upsert_audit(spark: SparkSession, audit: DataFrame, audit_path: str) -> None:
+    """Insert or replace the audit row of one microbatch (keyed by batch_id)."""
+
+    if not DeltaTable.isDeltaTable(spark, audit_path):
+        audit.write.format("delta").mode("errorifexists").save(audit_path)
+        return
+    (
+        DeltaTable.forPath(spark, audit_path)
+        .alias("t")
+        .merge(audit.alias("s"), "t.batch_id = s.batch_id")
+        .whenMatchedUpdateAll()
+        .whenNotMatchedInsertAll()
+        .execute()
+    )
+
+
+def process_batch(
+    spark: SparkSession,
+    df: DataFrame,
+    batch_id: int,
+    silver: str,
+    rejected_path: str,
+    audit_path: str,
+) -> None:
+    """foreachBatch handler.
+
+    Spark may replay a microbatch after a crash, so every write is an
+    idempotent MERGE. The three tables are three separate Delta commits, not
+    one cross-table transaction; batch_audit is a summary, not a lock.
+    """
+
     if df.isEmpty():
         return
     df = df.persist()
-    valid = rejected = winners = None
+    winners = None
     try:
         valid, rejected = validate_and_split(df)
-
-        # Cache only raw microbatch and deduplicated winners to reduce local disk spill.
+        # Cache only the raw microbatch and the winners to limit local spill.
         winners = deduplicate(valid).persist()
 
         incoming = df.count()
         valid_count = valid.count()
-        rejected_count = rejected.count()
-        winner_count = winners.count()
-        version_before = latest_commit(spark, silver)
-        if winner_count:
+        counts = {
+            "incoming": incoming,
+            "valid": valid_count,
+            "rejected": incoming - valid_count,
+            "winners": winners.count(),
+        }
+        before = latest_commit(spark, silver)
+        if counts["winners"]:
             merge_silver(spark, winners, silver)
-        version_after = latest_commit(spark, silver)
-        if rejected_count:
+        after = latest_commit(spark, silver)
+        if counts["rejected"]:
             merge_rejected(spark, rejected, rejected_path)
-        
-        # This audit is a *microbatch summary*, not an atomic transaction
-        # across the Silver and quarantine tables.
-        
-        # audit = spark.createDataFrame([(
-        #     int(batch_id), int(incoming), int(valid_count), int(rejected_count),
-        #     int(winner_count))],
-        #     "batch_id long, incoming long, valid long, rejected long, winners long")
-        # audit = (audit.withColumn("processed_at", F.current_timestamp())
-        #     .withColumn("silver_version_before", F.lit(version_before["version"] if version_before else None).cast("long"))
-        #     .withColumn("silver_version_after", F.lit(version_after["version"] if version_after else None).cast("long"))
-        #     .withColumn("silver_operation", F.lit(version_after["operation"] if version_after else None))
-        #     .withColumn("silver_operation_metrics", F.lit(json.dumps(version_after["operationMetrics"] if version_after else {})))
-        #     .withColumn("silver_commit_timestamp", F.lit(version_after["timestamp"] if version_after else None)))
-        
 
-        # Create audit row using Spark SQL expressions instead of PythonRDD.
-        # Avoid launching a Python worker solely for audit DataFrame creation.
-
-        audit = spark.range(1).select(
-            F.lit(int(batch_id)).cast("long").alias("batch_id"),
-            F.lit(int(incoming)).cast("long").alias("incoming"),
-            F.lit(int(valid_count)).cast("long").alias("valid"),
-            F.lit(int(rejected_count)).cast("long").alias("rejected"),
-            F.lit(int(winner_count)).cast("long").alias("winners"),
-            F.current_timestamp().alias("processed_at"),
-            F.lit(
-                version_before["version"]
-                if version_before else None
-            ).cast("long").alias("silver_version_before"),
-            F.lit(
-                version_after["version"]
-                if version_after else None
-            ).cast("long").alias("silver_version_after"),
-            F.lit(
-                version_after["operation"]
-                if version_after else None
-            ).cast("string").alias("silver_operation"),
-            F.lit(
-                json.dumps(
-                    version_after["operationMetrics"]
-                    if version_after else {}
-                )
-            ).alias("silver_operation_metrics"),
-            F.lit(
-                version_after["timestamp"]
-                if version_after else None
-            ).cast("string").alias("silver_commit_timestamp"),
+        _upsert_audit(spark, _audit_row(spark, batch_id, counts, before, after), audit_path)
+        LOG.info(
+            json.dumps(
+                {
+                    "event": "silver_batch",
+                    "batch_id": batch_id,
+                    "silver_version_before": _version(before),
+                    "silver_version_after": _version(after),
+                    "silver_operation": after["operation"] if after else None,
+                    **counts,
+                }
+            )
         )
-
-        if not DeltaTable.isDeltaTable(spark, audit_path):
-            audit.write.format("delta").mode("errorifexists").save(audit_path)
-        else:
-            (DeltaTable.forPath(spark, audit_path).alias("t")
-             .merge(audit.alias("s"), "t.batch_id = s.batch_id")
-             .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute())
-        LOG.info(json.dumps({"event":"silver_batch", "batch_id":batch_id,
-            "silver_version_before":version_before["version"] if version_before else None,
-            "silver_version_after":version_after["version"] if version_after else None,
-            "silver_operation":version_after["operation"] if version_after else None,
-            "incoming":incoming,"valid":valid_count,"rejected":rejected_count,
-            "winners":winner_count}))
     finally:
-        if winners is not None: winners.unpersist()
-        if rejected is not None: rejected.unpersist()
-        if valid is not None: valid.unpersist()
+        if winners is not None:
+            winners.unpersist()
         df.unpersist()
 
 
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--bronze", default=str(ROOT / "data/bronze/taxi_trips"))
-    p.add_argument("--silver", default=str(ROOT / "data/silver/taxi_trips"))
-    p.add_argument("--rejected", default=str(ROOT / "data/silver/rejected_records"))
-    p.add_argument("--audit", default=str(ROOT / "data/silver/batch_audit"))
-    p.add_argument("--checkpoint", default=str(ROOT / "data/checkpoints/silver_taxi"))
-    p.add_argument("--master", default="local[2]")
-    mode = p.add_mutually_exclusive_group()
-    mode.add_argument("--once", action="store_true", help="Process all available Bronze commits and exit")
-    mode.add_argument("--continuous", action="store_true", help="Keep watching Bronze for new commits")
-    p.add_argument("--interval", default="60 seconds")
-    p.add_argument("--max-bytes-per-trigger", default="128m",
-                   help="Soft input-size limit for each Delta microbatch")
-    return p.parse_args(argv)
+def run_silver(
+    spark: SparkSession,
+    bronze: str = str(BRONZE_PATH),
+    silver: str = str(SILVER_PATH),
+    rejected: str = str(REJECTED_PATH),
+    audit: str = str(BATCH_AUDIT_PATH),
+    checkpoint: str = str(SILVER_CHECKPOINT),
+    continuous: bool = False,
+    interval: str = "60 seconds",
+    max_bytes_per_trigger: str = "128m",
+) -> dict:
+    """Process new Bronze commits into Silver and return a summary dict.
+
+    By default uses ``availableNow``: every pending Bronze commit is processed
+    in size-bounded microbatches, then the query stops. ``continuous=True``
+    keeps polling Bronze every ``interval`` and only returns on failure.
+    """
+
+    if not DeltaTable.isDeltaTable(spark, bronze):
+        raise FileNotFoundError("Bronze Delta table missing: " + bronze)
+    for path in (silver, rejected, audit, checkpoint):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+    before = latest_commit(spark, silver)
+    # maxBytesPerTrigger is the Delta source option (a soft limit per file),
+    # not the spark.sql.streaming.* session setting.
+    stream = (
+        spark.readStream.format("delta")
+        .option("maxBytesPerTrigger", max_bytes_per_trigger)
+        .load(bronze)
+    )
+    writer = (
+        stream.writeStream.queryName(QUERY_NAME)
+        .option("checkpointLocation", checkpoint)
+        .foreachBatch(
+            lambda batch, batch_id: process_batch(spark, batch, batch_id, silver, rejected, audit)
+        )
+    )
+    if continuous:
+        writer = writer.trigger(processingTime=interval)
+    else:
+        writer = writer.trigger(availableNow=True)
+    query = writer.start()
+    query.awaitTermination()
+    if query.exception():
+        raise RuntimeError(str(query.exception()))
+
+    after = latest_commit(spark, silver)
+    summary = {
+        "event": "silver_finished",
+        "silver_path": silver,
+        "silver_version_before": _version(before),
+        "silver_version_after": _version(after),
+        "microbatches": sum(1 for p in query.recentProgress if p.get("numInputRows", 0) > 0),
+    }
+    LOG.info(json.dumps(summary))
+    return summary
 
 
-def main(argv=None):
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--bronze", default=str(BRONZE_PATH))
+    parser.add_argument("--silver", default=str(SILVER_PATH))
+    parser.add_argument("--rejected", default=str(REJECTED_PATH))
+    parser.add_argument("--audit", default=str(BATCH_AUDIT_PATH))
+    parser.add_argument("--checkpoint", default=str(SILVER_CHECKPOINT))
+    parser.add_argument("--master", default="local[*]")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--once", action="store_true", help="Process all available Bronze commits and exit (default)"
+    )
+    mode.add_argument(
+        "--continuous", action="store_true", help="Keep watching Bronze for new commits"
+    )
+    parser.add_argument("--interval", default="60 seconds")
+    parser.add_argument(
+        "--max-bytes-per-trigger",
+        default="128m",
+        help="Soft input-size limit for each Delta microbatch",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None) -> None:
+    from src.common.spark import create_spark
+
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    spark = make_spark(args.master)
+    spark = create_spark("silver-cdc", args.master)
     try:
-        if not DeltaTable.isDeltaTable(spark, args.bronze):
-            raise FileNotFoundError("Bronze Delta table missing: " + args.bronze)
-        for p in (args.silver, args.rejected, args.audit, args.checkpoint):
-            Path(p).parent.mkdir(parents=True, exist_ok=True)
-        # Delta microbatch input option: NOT spark.sql.streaming.maxBytesPerTrigger.
-        stream = (spark.readStream.format("delta")
-                  .option("maxBytesPerTrigger", args.max_bytes_per_trigger)
-                  .load(args.bronze))
-        writer = (stream.writeStream.queryName("silver_taxi_cdc")
-            .option("checkpointLocation", args.checkpoint)
-            .foreachBatch(lambda batch, bid: process_batch(
-                spark, batch, bid, args.silver, args.rejected, args.audit)))
-        if args.continuous:
-            writer = writer.trigger(processingTime=args.interval)
-        else:
-            writer = writer.trigger(availableNow=True)
-        query = writer.start()
-        query.awaitTermination()
-        if query.exception():
-            raise RuntimeError(str(query.exception()))
+        run_silver(
+            spark,
+            args.bronze,
+            args.silver,
+            args.rejected,
+            args.audit,
+            args.checkpoint,
+            continuous=args.continuous,
+            interval=args.interval,
+            max_bytes_per_trigger=args.max_bytes_per_trigger,
+        )
     finally:
         spark.stop()
 

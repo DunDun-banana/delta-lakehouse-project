@@ -1,23 +1,24 @@
 # Data folder
 
-## Objective
+Everything under `data/` is local-only and ignored by Git, except this file.
+All paths are defined once in `src/common/config.py`.
 
-The `data/` folder is intended for sample data, small test datasets, and demonstration data used by the project.
+| Path | Content | Created by |
+|---|---|---|
+| `source/` | `yellow_tripdata_2025-01.parquet` ... `-12.parquet` from NYC TLC (~830 MB), never modified | manual download |
+| `landing/dirty_test.parquet/` | 5,218-row dirty fixture (Parquet directory) | `src.bronze.prepare_dirty_parquet` |
+| `bronze/taxi_trips/` | Bronze Delta table | `src.bronze.bronze_ingestion` |
+| `silver/taxi_trips/` | Silver Delta table | `src.silver.silver_pipeline` |
+| `silver/rejected_records/` | rejected rows with reasons | `src.silver.silver_pipeline` |
+| `silver/batch_audit/` | one row per Silver microbatch | `src.silver.silver_pipeline` |
+| `checkpoints/silver_taxi/` | streaming checkpoint of the Silver query | `src.silver.silver_pipeline` |
+| `gold/zone_hourly_metrics/` | Gold Delta table | `src.gold.gold_aggregation` |
+| `tmp/` | Spark shuffle / spill scratch (`spark.local.dir`) | Spark |
 
-## Rules
+Rules:
 
-- Only small sample data should be committed.
-- Do not commit full datasets such as a large NYC Taxi dataset.
-- Do not commit generated Bronze, Silver, or Gold layer tables.
-- Do not commit large Parquet or Delta table files.
-- Generated landing fixtures are local-only and ignored by Git.
-- If a tiny tracked fixture is needed for unit tests, store it under `data/sample/`.
-
-## Recommended structure
-
-- `data/source/`: downloaded official NYC TLC monthly Parquet files; local-only
-- `data/landing/`: generated `dirty_test.parquet` used by Bronze ingestion; local-only
-- `data/sample/`: tiny tracked data for demo and local validation
-- `data/bronze/`: ignored by Git and generated when the pipeline runs
-- `data/silver/`: ignored by Git and generated when the pipeline runs
-- `data/gold/`: ignored by Git and generated when the pipeline runs
+- Never edit files inside a Delta table directory by hand.
+- `checkpoints/silver_taxi` and the three `silver/` tables belong together:
+  delete or restore all four at once.
+- Do not run `VACUUM` while time travel to older versions is still needed.
+- `tmp/` can be emptied when no Spark job is running.

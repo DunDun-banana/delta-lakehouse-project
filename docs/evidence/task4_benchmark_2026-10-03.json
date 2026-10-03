@@ -1,0 +1,194 @@
+{
+  "date": "2026-10-03",
+  "environment": {
+    "spark": "3.4.1",
+    "delta_spark": "2.4.0",
+    "master": "local[*]",
+    "cpu_count": 8,
+    "driver_memory": "8g"
+  },
+  "silver_path": "/Volumes/Lexar E6/Code/delta-lakehouse-project/data/silver/taxi_trips",
+  "zorder_column": "PULocationID",
+  "warmup_runs": 1,
+  "measured_runs": 5,
+  "versions": {
+    "A_baseline": 46,
+    "B_compaction": 47,
+    "C_zorder": 48
+  },
+  "optimize_runs": {
+    "compaction": {
+      "version": 47,
+      "zorder_by": [],
+      "seconds": 223.2,
+      "files_removed": 689,
+      "files_added": 9,
+      "bytes_added": 9772777082
+    },
+    "zorder": {
+      "version": 48,
+      "zorder_by": [
+        "PULocationID"
+      ],
+      "seconds": 495.4,
+      "files_removed": 9,
+      "files_added": 9,
+      "bytes_added": 9668476441
+    }
+  },
+  "results": [
+    {
+      "state": "A_baseline",
+      "version": 46,
+      "query": "Q1_single_zone",
+      "description": "Stats for one pickup zone (132 = JFK)",
+      "files_total": 689,
+      "files_to_read": 688,
+      "runs_s": [
+        5.134,
+        4.744,
+        4.614,
+        5.397,
+        4.455
+      ],
+      "median_s": 4.744,
+      "speedup_vs_A": 1.0
+    },
+    {
+      "state": "A_baseline",
+      "version": 46,
+      "query": "Q2_zone_range",
+      "description": "Stats for pickup zones 100-120",
+      "files_total": 689,
+      "files_to_read": 688,
+      "runs_s": [
+        4.119,
+        5.821,
+        6.487,
+        6.552,
+        5.753
+      ],
+      "median_s": 5.821,
+      "speedup_vs_A": 1.0
+    },
+    {
+      "state": "A_baseline",
+      "version": 46,
+      "query": "Q3_full_gold",
+      "description": "Full Gold aggregation without filter (control query)",
+      "files_total": 689,
+      "files_to_read": 689,
+      "runs_s": [
+        17.577,
+        15.79,
+        16.628,
+        15.968,
+        16.527
+      ],
+      "median_s": 16.527,
+      "speedup_vs_A": 1.0
+    },
+    {
+      "state": "B_compaction",
+      "version": 47,
+      "query": "Q1_single_zone",
+      "description": "Stats for one pickup zone (132 = JFK)",
+      "files_total": 9,
+      "files_to_read": 9,
+      "runs_s": [
+        3.131,
+        3.539,
+        2.539,
+        2.704,
+        2.794
+      ],
+      "median_s": 2.794,
+      "speedup_vs_A": 1.7
+    },
+    {
+      "state": "B_compaction",
+      "version": 47,
+      "query": "Q2_zone_range",
+      "description": "Stats for pickup zones 100-120",
+      "files_total": 9,
+      "files_to_read": 9,
+      "runs_s": [
+        3.02,
+        3.155,
+        3.058,
+        2.716,
+        2.825
+      ],
+      "median_s": 3.02,
+      "speedup_vs_A": 1.93
+    },
+    {
+      "state": "B_compaction",
+      "version": 47,
+      "query": "Q3_full_gold",
+      "description": "Full Gold aggregation without filter (control query)",
+      "files_total": 9,
+      "files_to_read": 9,
+      "runs_s": [
+        12.571,
+        11.155,
+        10.803,
+        14.122,
+        12.731
+      ],
+      "median_s": 12.571,
+      "speedup_vs_A": 1.31
+    },
+    {
+      "state": "C_zorder",
+      "version": 48,
+      "query": "Q1_single_zone",
+      "description": "Stats for one pickup zone (132 = JFK)",
+      "files_total": 9,
+      "files_to_read": 1,
+      "runs_s": [
+        0.586,
+        0.696,
+        0.588,
+        0.612,
+        0.7
+      ],
+      "median_s": 0.612,
+      "speedup_vs_A": 7.75
+    },
+    {
+      "state": "C_zorder",
+      "version": 48,
+      "query": "Q2_zone_range",
+      "description": "Stats for pickup zones 100-120",
+      "files_total": 9,
+      "files_to_read": 2,
+      "runs_s": [
+        0.964,
+        0.931,
+        1.05,
+        0.813,
+        0.898
+      ],
+      "median_s": 0.931,
+      "speedup_vs_A": 6.25
+    },
+    {
+      "state": "C_zorder",
+      "version": 48,
+      "query": "Q3_full_gold",
+      "description": "Full Gold aggregation without filter (control query)",
+      "files_total": 9,
+      "files_to_read": 9,
+      "runs_s": [
+        10.142,
+        9.022,
+        8.963,
+        7.984,
+        8.796
+      ],
+      "median_s": 8.963,
+      "speedup_vs_A": 1.84
+    }
+  ]
+}

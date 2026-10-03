@@ -1,74 +1,156 @@
-"""Distributed, lazy Silver validation; never collect individual taxi rows to driver."""
-from pyspark.sql import DataFrame, functions as F, Window
+"""Silver data-quality rules, business hash and deduplication.
 
-REQUIRED = {"trip_id", "tpep_pickup_datetime", "tpep_dropoff_datetime", "PULocationID", "DOLocationID", "fare_amount", "ingested_at", "raw_record_hash", "ingest_batch_id"}
+Everything here is a lazy, distributed DataFrame transformation; no taxi row
+is ever collected to the driver.
+"""
+
+from __future__ import annotations
+
+from pyspark.sql import Column, DataFrame, Window
+from pyspark.sql import functions as F
+
+from src.common.ids import TIMESTAMP_FORMAT
+
+REQUIRED = {
+    "trip_id",
+    "tpep_pickup_datetime",
+    "tpep_dropoff_datetime",
+    "PULocationID",
+    "DOLocationID",
+    "fare_amount",
+    "ingested_at",
+    "raw_record_hash",
+    "ingest_batch_id",
+}
+
+# Columns whose change counts as a real CDC change. Lineage columns
+# (record_source, ingest_batch_id, source_file, ...) and synthetic GPS are
+# excluded on purpose: a re-ingested copy of the same trip with identical
+# amounts must not overwrite Silver. surcharge_fee is listed so the schema
+# evolution demo is detected as a change once the column exists.
+CDC_COLUMNS = [
+    "fare_amount", "tip_amount", "total_amount", "extra", "mta_tax", "tolls_amount",
+    "improvement_surcharge", "congestion_surcharge", "Airport_fee", "cbd_congestion_fee",
+    "passenger_count", "payment_type", "surcharge_fee",
+]
+
+# Bounding box for the synthetic fixture coordinates (around New York City).
+LAT_RANGE = (40.0, 41.5)
+LON_RANGE = (-74.5, -73.0)
+GPS_COLUMNS = (
+    ("pickup_latitude", LAT_RANGE),
+    ("pickup_longitude", LON_RANGE),
+    ("dropoff_latitude", LAT_RANGE),
+    ("dropoff_longitude", LON_RANGE),
+)
+
+_RAW_DATE_COLUMNS = ("raw_pickup_datetime", "raw_dropoff_datetime")
 
 
 def validate_contract(df: DataFrame) -> None:
+    """Fail fast if Bronze no longer provides the columns Silver relies on."""
+
     missing = sorted(REQUIRED - set(df.columns))
     if missing:
         raise ValueError("Bronze is missing required columns: " + ", ".join(missing))
 
 
-def validate_and_split(df: DataFrame) -> tuple[DataFrame, DataFrame]:
-    """Return (valid, rejected), retaining rejected raw values and reason codes."""
-    validate_contract(df)
-    pickup = F.to_timestamp(F.col("tpep_pickup_datetime"), "yyyy-MM-dd HH:mm:ss")
-    dropoff = F.to_timestamp(F.col("tpep_dropoff_datetime"), "yyyy-MM-dd HH:mm:ss")
-    # Keep unmodified strings in quarantine for audit; valid rows retain clean timestamps.
-    out = (df.withColumn("raw_pickup_datetime", F.col("tpep_pickup_datetime"))
-             .withColumn("raw_dropoff_datetime", F.col("tpep_dropoff_datetime"))
-             .withColumn("tpep_pickup_datetime", pickup)
-             .withColumn("tpep_dropoff_datetime", dropoff))
-    checks = [
+def _invalid_gps() -> Column:
+    invalid = None
+    for column, (low, high) in GPS_COLUMNS:
+        value = F.col(column)
+        check = value.isNull() | (value < low) | (value > high)
+        invalid = check if invalid is None else invalid | check
+    return invalid
+
+
+def quality_checks() -> list[tuple[Column, str]]:
+    """Return the 9 rules as (condition that marks a row invalid, reason code).
+
+    Expects parsed timestamp columns. The order of the list is the order of
+    the reason codes in ``rejection_reasons``.
+    """
+
+    pickup, dropoff = F.col("tpep_pickup_datetime"), F.col("tpep_dropoff_datetime")
+    pu, do = F.col("PULocationID"), F.col("DOLocationID")
+    fare = F.col("fare_amount")
+    return [
         (F.col("trip_id").isNull() | (F.length(F.trim("trip_id")) == 0), "missing_trip_id"),
-        (F.col("tpep_pickup_datetime").isNull() | F.col("tpep_dropoff_datetime").isNull(), "invalid_datetime"),
-        (F.col("tpep_dropoff_datetime") < F.col("tpep_pickup_datetime"), "dropoff_before_pickup"),
-        (F.col("PULocationID").isNull() | F.col("DOLocationID").isNull() |
-         (F.col("PULocationID") <= 0) | (F.col("DOLocationID") <= 0), "invalid_location"),
-        (F.col("fare_amount").isNull() | F.isnan("fare_amount") | (F.col("fare_amount") <= 0), "invalid_fare"),
+        # Unparseable strings are NULL after to_timestamp (ANSI mode is off).
+        (pickup.isNull() | dropoff.isNull(), "invalid_datetime"),
+        (dropoff < pickup, "dropoff_before_pickup"),
+        (pu.isNull() | do.isNull() | (pu <= 0) | (do <= 0), "invalid_location"),
+        # NaN is a valid double and NaN <= 0 is false in Spark, so it needs
+        # its own check or it would pass the fare rule.
+        (fare.isNull() | F.isnan("fare_amount") | (fare <= 0), "invalid_fare"),
         (F.col("trip_distance").isNull() | (F.col("trip_distance") < 0), "invalid_distance"),
         (F.col("total_amount").isNull() | (F.col("total_amount") <= 0), "invalid_total_amount"),
-        (F.col("passenger_count").isNotNull() & (F.col("passenger_count") < 0), "invalid_passenger_count"),
-        
-        # The real NYC TLC monthly Parquet files have location IDs but no GPS.
-        # Only validate synthetic coordinates on the generated fixture.
+        # TLC leaves passenger_count NULL for many trips (e.g. some vendors),
+        # so NULL is kept; only impossible negative counts are rejected.
         (
-            (F.col("record_source") == "generated_fixture") & (
-                F.col("pickup_latitude").isNull() |
-                F.col("pickup_longitude").isNull() |
-                F.col("dropoff_latitude").isNull() |
-                F.col("dropoff_longitude").isNull() |
-                (F.col("pickup_latitude") < 40.0) |
-                (F.col("pickup_latitude") > 41.5) |
-                (F.col("pickup_longitude") < -74.5) |
-                (F.col("pickup_longitude") > -73.0) |
-                (F.col("dropoff_latitude") < 40.0) |
-                (F.col("dropoff_latitude") > 41.5) |
-                (F.col("dropoff_longitude") < -74.5) |
-                (F.col("dropoff_longitude") > -73.0)
-            ),
-            "invalid_coordinates"
+            F.col("passenger_count").isNotNull() & (F.col("passenger_count") < 0),
+            "invalid_passenger_count",
         ),
+        # Official TLC files have zone IDs but no GPS, so coordinates are only
+        # checked on the generated fixture that carries synthetic GPS.
+        ((F.col("record_source") == "generated_fixture") & _invalid_gps(), "invalid_coordinates"),
     ]
-    reasons = F.array(*[F.when(condition, F.lit(reason)) for condition, reason in checks])
-    out = out.withColumn("rejection_reasons", F.filter(reasons, lambda x: x.isNotNull()))
-    valid = (out.filter(F.size("rejection_reasons") == 0)
-             .drop("rejection_reasons", "raw_pickup_datetime", "raw_dropoff_datetime"))
-    rejected = out.filter(F.size("rejection_reasons") > 0)
-    return valid, rejected
+
+
+def add_business_hash(df: DataFrame) -> DataFrame:
+    """Hash the CDC columns present in ``df``; MERGE updates only when it differs."""
+
+    present = [c for c in CDC_COLUMNS if c in df.columns]
+    return df.withColumn(
+        "business_hash", F.sha2(F.to_json(F.struct(*[F.col(c) for c in present])), 256)
+    )
+
+
+def validate_and_split(df: DataFrame) -> tuple[DataFrame, DataFrame]:
+    """Return (valid, rejected).
+
+    Valid rows get parsed timestamps and ``business_hash``. Rejected rows keep
+    the raw date strings and every failed reason code in ``rejection_reasons``.
+    """
+
+    validate_contract(df)
+    parsed = (
+        df.withColumn("raw_pickup_datetime", F.col("tpep_pickup_datetime"))
+        .withColumn("raw_dropoff_datetime", F.col("tpep_dropoff_datetime"))
+        .withColumn(
+            "tpep_pickup_datetime", F.to_timestamp("tpep_pickup_datetime", TIMESTAMP_FORMAT)
+        )
+        .withColumn(
+            "tpep_dropoff_datetime", F.to_timestamp("tpep_dropoff_datetime", TIMESTAMP_FORMAT)
+        )
+    )
+    reasons = F.array(*[F.when(condition, F.lit(code)) for condition, code in quality_checks()])
+    checked = parsed.withColumn(
+        "rejection_reasons", F.filter(reasons, lambda reason: reason.isNotNull())
+    )
+    valid = checked.filter(F.size("rejection_reasons") == 0).drop(
+        "rejection_reasons", *_RAW_DATE_COLUMNS
+    )
+    rejected = checked.filter(F.size("rejection_reasons") > 0)
+    return add_business_hash(valid), rejected
 
 
 def deduplicate(df: DataFrame) -> DataFrame:
-    """One deterministic winner per trip; newest Bronze ingestion wins.
+    """Keep one deterministic winner per ``trip_id``: the newest Bronze row.
 
-    Bronze has no source event timestamp: ingested_at is processing order, NOT
-    authoritative event-time CDC. Ties break by raw_record_hash and batch ID.
+    Bronze has no source event time, so ``ingested_at`` (processing order) is
+    the recency signal; ties break on batch ID then raw hash. ``row_number``
+    is used instead of ``dropDuplicates`` because dropDuplicates keeps an
+    arbitrary row, which would make CDC replays non-deterministic.
     """
+
     window = Window.partitionBy("trip_id").orderBy(
         F.col("ingested_at").desc_nulls_last(),
         F.col("ingest_batch_id").desc_nulls_last(),
         F.col("raw_record_hash").desc_nulls_last(),
     )
-    return (df.withColumn("_silver_rank", F.row_number().over(window))
-              .filter(F.col("_silver_rank") == 1).drop("_silver_rank"))
+    return (
+        df.withColumn("_silver_rank", F.row_number().over(window))
+        .filter(F.col("_silver_rank") == 1)
+        .drop("_silver_rank")
+    )

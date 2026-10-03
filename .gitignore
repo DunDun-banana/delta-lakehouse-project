@@ -1,13 +1,21 @@
-.venv/
-__pycache__/
-.ipynb_checkpoints/
-.DS_Store
+# Local data and Delta tables (only data/README.md is tracked)
+data/*
+!data/README.md
 
-data/bronze/
-data/silver/
-data/gold/
-data/landing/
+# Logs and runtime output
 logs/
-temp/
-data/tmp/
-data/checkpoints/
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv*/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store

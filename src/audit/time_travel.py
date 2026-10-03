@@ -18,6 +18,11 @@ from pathlib import Path
 from urllib.parse import unquote
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
 
+from src.common.config import SILVER_PATH
+# latest_commit lives in common.delta_utils; importing it here keeps the
+# Task 3 API (src.audit.time_travel.latest_commit) unchanged.
+from src.common.delta_utils import latest_commit
+
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame, SparkSession
 
@@ -57,23 +62,6 @@ def normalize_history(rows: Iterable[Any]) -> list[dict[str, Any]]:
             }
         )
     return sorted(result, key=lambda row: row["version"])
-
-
-def latest_commit(spark: "SparkSession", path: str) -> dict[str, Any] | None:
-    DeltaTable = _delta_table()
-    if not DeltaTable.isDeltaTable(spark, path):
-        return None
-    rows = DeltaTable.forPath(spark, path).history(1).collect()
-    if not rows:
-        return None
-    row = rows[0].asDict(recursive=True)
-    return {
-        "version": int(row["version"]),
-        "timestamp": str(row["timestamp"]),
-        "operation": row.get("operation"),
-        "operationParameters": row.get("operationParameters") or {},
-        "operationMetrics": row.get("operationMetrics") or {},
-    }
 
 
 def read_version(spark: "SparkSession", path: str, version: int) -> "DataFrame":
@@ -387,7 +375,7 @@ def _records(frame: "DataFrame") -> list[dict[str, Any]]:
 
 
 def table_detail(spark: "SparkSession", path: str) -> dict[str, Any]:
-    """``DESCRIBE DETAIL``: protocol versions, partitioning and file counts."""
+    """Table detail (same as DESCRIBE DETAIL): protocol, partitioning, file count."""
 
     return _delta_table().forPath(spark, path).detail().collect()[0].asDict(recursive=True)
 
@@ -668,10 +656,10 @@ def run_audit(
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    from src.silver.silver_pipeline import ROOT
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--silver", default=str(ROOT / "data/silver/taxi_trips"))
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--silver", default=str(SILVER_PATH))
     parser.add_argument("--history", dest="history_limit", type=int, default=100)
     parser.add_argument("--update-version", type=int)
     parser.add_argument("--insert-version", type=int)
@@ -683,10 +671,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    from src.silver.silver_pipeline import make_spark
+    from src.common.spark import create_spark
 
     args = parse_args(argv)
-    spark = make_spark(args.master)
+    spark = create_spark("time-travel-audit", args.master)
     try:
         evidence = run_audit(
             spark,
