@@ -1,123 +1,86 @@
 """Task 1 - append-only Bronze ingestion for NYC TLC Parquet data.
 
-The official monthly Parquet files remain immutable under ``data/source``.
-This module reads each input as a separate batch and appends it to one Delta
-table.  The small ``data/landing/dirty_test.parquet`` fixture is appended as
-another batch so Bronze preserves malformed values, missing fields, and
-duplicates for later Silver validation.
+Each input (one monthly TLC file, or the dirty fixture) is one batch and one
+Delta append commit. Bronze keeps values as they arrive: malformed dates,
+missing zones, negative fares and duplicates all survive so Silver can reject
+or deduplicate them with an explicit reason.
+
+Re-running is safe: a batch whose ``ingest_batch_id`` (the input file stem)
+already exists in Bronze is skipped instead of appended twice.
+
+Run from the project root:
+    python -m src.bronze.bronze_ingestion
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import logging
 from pathlib import Path
-from typing import Iterable
 
-from delta import configure_spark_with_delta_pip
+from delta.tables import DeltaTable
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
+from src.common.config import BRONZE_PATH, DIRTY_FIXTURE, SOURCE_DIR
+from src.common.ids import add_trip_id
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SOURCE_DIR = PROJECT_ROOT / "data" / "source"
-DIRTY_INPUT = PROJECT_ROOT / "data" / "landing" / "dirty_test.parquet"
-DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "bronze" / "taxi_trips"
+LOG = logging.getLogger("bronze")
 
-
-def create_spark() -> SparkSession:
-    """Create a local Spark session configured for Delta Lake."""
-
-    builder = (
-        SparkSession.builder
-        .appName("Taxi-Bronze-Ingestion")
-        .master("local[*]")
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
-        .config("spark.databricks.delta.schema.autoMerge.enabled", "true")
-        .config("spark.sql.session.timeZone", "UTC")
-    )
-    return configure_spark_with_delta_pip(builder).getOrCreate()
-
-
-def create_trip_id(df: DataFrame) -> DataFrame:
-    """Create a deterministic ID only for source rows that do not have one."""
-
-    pickup = F.date_format(
-        F.to_timestamp(F.col("tpep_pickup_datetime")),
-        "yyyy-MM-dd HH:mm:ss",
-    )
-    dropoff = F.date_format(
-        F.to_timestamp(F.col("tpep_dropoff_datetime")),
-        "yyyy-MM-dd HH:mm:ss",
-    )
-    identity = F.concat_ws(
-        "||",
-        *[
-            F.coalesce(F.col(column).cast("string"), F.lit(""))
-            for column in ["VendorID", "PULocationID", "DOLocationID", "trip_distance"]
-        ],
-        F.coalesce(pickup, F.lit("")),
-        F.coalesce(dropoff, F.lit("")),
-    )
-    return df.withColumn("trip_id", F.sha2(identity, 256))
+# Monthly files disagree on integer widths (int32 vs int64) and Delta cannot
+# merge two types for one column. Casting only establishes one Bronze schema;
+# no value is removed or validated here.
+LONG_COLUMNS = (
+    "VendorID",
+    "passenger_count",
+    "RatecodeID",
+    "PULocationID",
+    "DOLocationID",
+    "payment_type",
+)
+DOUBLE_COLUMNS = (
+    "trip_distance",
+    "fare_amount",
+    "extra",
+    "mta_tax",
+    "tip_amount",
+    "tolls_amount",
+    "improvement_surcharge",
+    "total_amount",
+    "congestion_surcharge",
+    "Airport_fee",
+    "cbd_congestion_fee",
+    "pickup_latitude",
+    "pickup_longitude",
+    "dropoff_latitude",
+    "dropoff_longitude",
+)
+# Dates stay strings so malformed fixture dates reach Silver unchanged.
+STRING_COLUMNS = ("tpep_pickup_datetime", "tpep_dropoff_datetime")
 
 
 def normalize_input(df: DataFrame) -> DataFrame:
-    """Align source and dirty-fixture schemas without cleaning the data."""
+    """Align official and fixture schemas without cleaning any value."""
 
     if "trip_id" not in df.columns:
-        df = create_trip_id(df)
-
+        df = add_trip_id(df)
     if "record_source" not in df.columns:
         df = df.withColumn("record_source", F.lit("official_tlc"))
 
-    # Parquet preserves the source schema exactly, so some official files use
-    # integer location IDs while the generated fixture uses long IDs.  Delta
-    # cannot merge those as two different column types.  These casts only
-    # establish one Bronze schema; they do not remove or validate any values.
-    long_columns = [
-        "VendorID",
-        "passenger_count",
-        "RatecodeID",
-        "PULocationID",
-        "DOLocationID",
-        "payment_type",
-    ]
-    double_columns = [
-        "trip_distance",
-        "fare_amount",
-        "extra",
-        "mta_tax",
-        "tip_amount",
-        "tolls_amount",
-        "improvement_surcharge",
-        "total_amount",
-        "congestion_surcharge",
-        "Airport_fee",
-        "cbd_congestion_fee",
-        "pickup_latitude",
-        "pickup_longitude",
-        "dropoff_latitude",
-        "dropoff_longitude",
-    ]
-    for column in long_columns:
-        if column in df.columns:
-            df = df.withColumn(column, F.col(column).cast("long"))
-    for column in double_columns:
-        if column in df.columns:
-            df = df.withColumn(column, F.col(column).cast("double"))
-
-    # Keep dates as strings so malformed dates from the dirty fixture survive
-    # Bronze ingestion and can be handled explicitly in Silver.
-    for column in ("tpep_pickup_datetime", "tpep_dropoff_datetime"):
-        if column in df.columns:
-            df = df.withColumn(column, F.col(column).cast("string"))
-
+    for columns, spark_type in (
+        (LONG_COLUMNS, "long"),
+        (DOUBLE_COLUMNS, "double"),
+        (STRING_COLUMNS, "string"),
+    ):
+        for column in columns:
+            if column in df.columns:
+                df = df.withColumn(column, F.col(column).cast(spark_type))
     return df
 
 
 def add_bronze_metadata(df: DataFrame, input_path: Path, batch_id: str) -> DataFrame:
-    """Add lineage and raw-record metadata while leaving business values intact."""
+    """Add lineage columns and a hash of the raw business values."""
 
     business_columns = df.columns
     return (
@@ -127,92 +90,129 @@ def add_bronze_metadata(df: DataFrame, input_path: Path, batch_id: str) -> DataF
         .withColumn("ingested_at", F.current_timestamp())
         .withColumn(
             "raw_record_hash",
-            F.sha2(F.to_json(F.struct(*[F.col(column) for column in business_columns])), 256),
+            F.sha2(F.to_json(F.struct(*[F.col(c) for c in business_columns])), 256),
         )
     )
 
 
+def already_ingested(spark: SparkSession, output_path: Path, batch_id: str) -> bool:
+    """True if Bronze already holds at least one row of ``batch_id``."""
+
+    if not DeltaTable.isDeltaTable(spark, str(output_path)):
+        return False
+    return (
+        spark.read.format("delta")
+        .load(str(output_path))
+        .filter(F.col("ingest_batch_id") == batch_id)
+        .limit(1)
+        .count()
+        > 0
+    )
+
+
 def ingest_batch(
-    spark: SparkSession,
-    input_path: Path,
-    output_path: Path,
-    batch_id: str,
+    spark: SparkSession, input_path: Path, output_path: Path, batch_id: str
 ) -> int:
-    """Read one Parquet batch and append it to the Bronze Delta table."""
+    """Append one Parquet input to Bronze and return the rows written."""
 
     input_path = input_path.resolve()
     if not input_path.exists():
         raise FileNotFoundError(f"Input Parquet path does not exist: {input_path}")
 
     raw_df = spark.read.parquet(str(input_path))
-    bronze_df = add_bronze_metadata(normalize_input(raw_df), input_path, batch_id)
-
     (
-        bronze_df.write
-        .format("delta")
+        add_bronze_metadata(normalize_input(raw_df), input_path, batch_id)
+        .write.format("delta")
         .mode("append")
+        # The fixture adds GPS columns that official files do not have.
         .option("mergeSchema", "true")
-        .save(str(output_path.resolve()))
+        .save(str(output_path))
     )
-
-    return bronze_df.count()
+    # Read the row count from the commit metrics instead of re-scanning data.
+    last_commit = DeltaTable.forPath(spark, str(output_path)).history(1).first()
+    return int(last_commit["operationMetrics"]["numOutputRows"])
 
 
 def default_inputs() -> list[Path]:
-    """Return all official monthly files followed by the dirty test batch."""
+    """All official monthly files (sorted by name) followed by the dirty fixture."""
 
     monthly_files = sorted(SOURCE_DIR.glob("yellow_tripdata_*.parquet"))
     if not monthly_files:
         raise FileNotFoundError(f"No monthly Parquet files found under {SOURCE_DIR}")
-    if not DIRTY_INPUT.exists():
+    if not DIRTY_FIXTURE.exists():
         raise FileNotFoundError(
-            f"Dirty fixture not found: {DIRTY_INPUT}. Run prepare_dirty_parquet.py first."
+            f"Dirty fixture not found: {DIRTY_FIXTURE}. "
+            "Run python -m src.bronze.prepare_dirty_parquet first."
         )
-    return [*monthly_files, DIRTY_INPUT]
+    return [*monthly_files, DIRTY_FIXTURE]
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+def run_bronze(
+    spark: SparkSession,
+    inputs: list[Path] | None = None,
+    output_path: Path = BRONZE_PATH,
+    batch_id: str | None = None,
+) -> dict:
+    """Ingest every input as one append batch and return a summary dict."""
+
+    inputs = list(inputs) if inputs else default_inputs()
+    if batch_id and len(inputs) != 1:
+        raise ValueError("batch_id can only be used with exactly one input")
+
+    output_path = Path(output_path).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    written, skipped = [], []
+    for input_path in inputs:
+        current_id = batch_id or input_path.stem
+        if already_ingested(spark, output_path, current_id):
+            LOG.info("Skip %s: already ingested into %s", current_id, output_path)
+            skipped.append(current_id)
+            continue
+        rows = ingest_batch(spark, input_path, output_path, current_id)
+        LOG.info("Appended %s rows from %s as batch %s", f"{rows:,}", input_path, current_id)
+        written.append({"batch_id": current_id, "rows": rows})
+
+    summary = {
+        "event": "bronze_ingested",
+        "bronze_path": str(output_path),
+        "batches_written": written,
+        "batches_skipped": skipped,
+        "rows_appended": sum(batch["rows"] for batch in written),
+        "bronze_total_rows": spark.read.format("delta").load(str(output_path)).count(),
+    }
+    LOG.info(json.dumps(summary))
+    return summary
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument(
         "--input",
         dest="inputs",
         action="append",
         type=Path,
-        help="One Parquet file/dataset. Repeat --input for multiple append batches.",
+        help="One Parquet file/dataset. Repeat --input for several append batches.",
     )
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--output", type=Path, default=BRONZE_PATH)
     parser.add_argument(
-        "--batch-id",
-        default=None,
-        help="Batch ID for a single input; otherwise each input stem is used.",
+        "--batch-id", help="Batch ID for a single --input; otherwise the input file stem."
     )
-    return parser.parse_args()
+    parser.add_argument("--master", default="local[*]")
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
-    inputs: Iterable[Path] = args.inputs or default_inputs()
-    inputs = list(inputs)
-    if not inputs:
-        raise ValueError("At least one Parquet input is required")
-    if args.batch_id and len(inputs) != 1:
-        raise ValueError("--batch-id can only be used with one --input")
+def main(argv=None) -> None:
+    from src.common.spark import create_spark
 
-    output_path = args.output.resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    spark = create_spark()
+    args = parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    spark = create_spark("bronze-ingestion", args.master)
     try:
-        total_rows = 0
-        for input_path in inputs:
-            batch_id = args.batch_id or input_path.stem
-            written_rows = ingest_batch(spark, input_path, output_path, batch_id)
-            total_rows += written_rows
-            print(f"Appended {written_rows:,} rows from {input_path} as batch {batch_id}")
-
-        bronze_total = spark.read.format("delta").load(str(output_path)).count()
-        print(f"Rows appended in this run: {total_rows:,}")
-        print(f"Bronze total rows: {bronze_total:,}")
-        print(f"Bronze path: {output_path}")
+        summary = run_bronze(spark, args.inputs, args.output, args.batch_id)
+        print(f"Rows appended in this run: {summary['rows_appended']:,}")
+        print(f"Bronze total rows: {summary['bronze_total_rows']:,}")
     finally:
         spark.stop()
 

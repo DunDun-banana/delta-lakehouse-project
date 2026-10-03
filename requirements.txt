@@ -1,5 +1,7 @@
-# cấu hình khớp với file setup của thầy
+# Pinned Spark / Delta stack (Python 3.10 or 3.11, Java 8/11/17)
 pyspark==3.4.1
 delta-spark==2.4.0
-findspark
 pytest
+
+# Optional: run the demo notebook
+# jupyterlab
