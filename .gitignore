@@ -1,11 +1,21 @@
-.venv/
-__pycache__/
-.ipynb_checkpoints/
-.DS_Store
+data/*
+!data/README.md
+!data/source/
 
-data/bronze/
-data/silver/
-data/gold/
-data/landing/
+# Logs and runtime output
 logs/
-temp/
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv*/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
